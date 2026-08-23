@@ -4,6 +4,7 @@ All storage is owned by NumPy.  Exported functions receive integer addresses
 and reconstruct explicitly-originated pointers inside the C ABI boundary.
 """
 
+from max.algorithm import parallelize
 from std.math import exp, floor, sqrt
 from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
@@ -32,37 +33,82 @@ def neighbor_count_one(
     self_interaction: Bool,
     cutoff2: Float64,
 ) -> Int:
+    comptime W = simd_width_of[DType.float64]()
     var count = 0
     var pix = positions[3 * i]
     var piy = positions[3 * i + 1]
     var piz = positions[3 * i + 2]
-    for j in range(n):
+    var base_ix = Int(base_shift[3 * i])
+    var base_iy = Int(base_shift[3 * i + 1])
+    var base_iz = Int(base_shift[3 * i + 2])
+    var j = 0
+    while j + W <= n:
+        var rawx = (positions + 3 * j).strided_load[width=W](3) - pix
+        var rawy = (positions + 3 * j + 1).strided_load[width=W](3) - piy
+        var rawz = (positions + 3 * j + 2).strided_load[width=W](3) - piz
+        var base_jx = (base_shift + 3 * j).strided_load[width=W](3)
+        var base_jy = (base_shift + 3 * j + 1).strided_load[width=W](3)
+        var base_jz = (base_shift + 3 * j + 2).strided_load[width=W](3)
+        for sx0 in range(-rx, rx + 1):
+            var sx = SIMD[DType.int64, W](base_ix + sx0) - base_jx
+            for sy0 in range(-ry, ry + 1):
+                var sy = SIMD[DType.int64, W](base_iy + sy0) - base_jy
+                for sz0 in range(-rz, rz + 1):
+                    var sz = SIMD[DType.int64, W](base_iz + sz0) - base_jz
+                    var dx = (
+                        rawx + sx.cast[DType.float64]() * cell[0]
+                        + sy.cast[DType.float64]() * cell[3]
+                        + sz.cast[DType.float64]() * cell[6]
+                    )
+                    var dy = (
+                        rawy + sx.cast[DType.float64]() * cell[1]
+                        + sy.cast[DType.float64]() * cell[4]
+                        + sz.cast[DType.float64]() * cell[7]
+                    )
+                    var dz = (
+                        rawz + sx.cast[DType.float64]() * cell[2]
+                        + sy.cast[DType.float64]() * cell[5]
+                        + sz.cast[DType.float64]() * cell[8]
+                    )
+                    var r2 = dx * dx + dy * dy + dz * dz
+                    count += Int(
+                        r2.lt(cutoff2).select(
+                            SIMD[DType.int64, W](1), SIMD[DType.int64, W](0)
+                        ).reduce_add()
+                    )
+                    if (
+                        not self_interaction and sx0 == 0 and sy0 == 0
+                        and sz0 == 0 and j <= i and i < j + W
+                        and 0.0 < cutoff2
+                    ):
+                        count -= 1
+        j += W
+    while j < n:
         var rawx = positions[3 * j] - pix
         var rawy = positions[3 * j + 1] - piy
         var rawz = positions[3 * j + 2] - piz
         for sx0 in range(-rx, rx + 1):
-            var sx = Int(base_shift[3 * i] - base_shift[3 * j]) + sx0
+            var sx = base_ix - Int(base_shift[3 * j]) + sx0
             for sy0 in range(-ry, ry + 1):
-                var sy = Int(base_shift[3 * i + 1] - base_shift[3 * j + 1]) + sy0
+                var sy = base_iy - Int(base_shift[3 * j + 1]) + sy0
                 for sz0 in range(-rz, rz + 1):
-                    var sz = Int(base_shift[3 * i + 2] - base_shift[3 * j + 2]) + sz0
-                    if not self_interaction and i == j and sx == 0 and sy == 0 and sz == 0:
-                        continue
-                    var dx = (
-                        rawx + Float64(sx) * cell[0]
-                        + Float64(sy) * cell[3] + Float64(sz) * cell[6]
-                    )
-                    var dy = (
-                        rawy + Float64(sx) * cell[1]
-                        + Float64(sy) * cell[4] + Float64(sz) * cell[7]
-                    )
-                    var dz = (
-                        rawz + Float64(sx) * cell[2]
-                        + Float64(sy) * cell[5] + Float64(sz) * cell[8]
-                    )
-                    var r2 = dx * dx + dy * dy + dz * dz
-                    if r2 < cutoff2:
-                        count += 1
+                    var sz = base_iz - Int(base_shift[3 * j + 2]) + sz0
+                    if self_interaction or i != j or sx != 0 or sy != 0 or sz != 0:
+                        var dx = (
+                            rawx + Float64(sx) * cell[0]
+                            + Float64(sy) * cell[3] + Float64(sz) * cell[6]
+                        )
+                        var dy = (
+                            rawy + Float64(sx) * cell[1]
+                            + Float64(sy) * cell[4] + Float64(sz) * cell[7]
+                        )
+                        var dz = (
+                            rawz + Float64(sx) * cell[2]
+                            + Float64(sy) * cell[5] + Float64(sz) * cell[8]
+                        )
+                        if dx * dx + dy * dy + dz * dz < cutoff2:
+                            count += 1
+        j += 1
     return count
 
 
@@ -120,20 +166,38 @@ def neighbor_counts(
 ) -> Int:
     var nonperiodic = rx == 0 and ry == 0 and rz == 0
 
-    for i in range(n):
-        if nonperiodic:
-            offsets[i] = Int64(
-                neighbor_count_one_nonperiodic(
-                    positions, n, i, self_interaction, cutoff2
+    var candidate_checks = n * n * (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1)
+    if not nonperiodic and candidate_checks >= 100_000 and n > 1:
+        var task_count = min(16, n)
+
+        @parameter
+        def count_chunk(task: Int):
+            var first = task * n // task_count
+            var last = (task + 1) * n // task_count
+            for i in range(first, last):
+                offsets[i] = Int64(
+                    neighbor_count_one(
+                        positions, cell, base_shift, n, i, rx, ry, rz,
+                        self_interaction, cutoff2,
+                    )
                 )
-            )
-        else:
-            offsets[i] = Int64(
-                neighbor_count_one(
-                    positions, cell, base_shift, n, i, rx, ry, rz,
-                    self_interaction, cutoff2,
+
+        parallelize[count_chunk](task_count, task_count)
+    else:
+        for i in range(n):
+            if nonperiodic:
+                offsets[i] = Int64(
+                    neighbor_count_one_nonperiodic(
+                        positions, n, i, self_interaction, cutoff2
+                    )
                 )
-            )
+            else:
+                offsets[i] = Int64(
+                    neighbor_count_one(
+                        positions, cell, base_shift, n, i, rx, ry, rz,
+                        self_interaction, cutoff2,
+                    )
+                )
 
     comptime W = simd_width_of[DType.float64]()
     var vector_total = SIMD[DType.int64, W](0)
@@ -171,46 +235,101 @@ def neighbor_fill_one(
     vectors: FPtr,
     shifts: IPtr,
 ) -> Int:
+    comptime W = simd_width_of[DType.float64]()
     var k = 0
     var pix = positions[3 * i]
     var piy = positions[3 * i + 1]
     var piz = positions[3 * i + 2]
-    for j in range(n):
+    var base_ix = Int(base_shift[3 * i])
+    var base_iy = Int(base_shift[3 * i + 1])
+    var base_iz = Int(base_shift[3 * i + 2])
+    var j = 0
+    while j + W <= n:
+        var rawx = (positions + 3 * j).strided_load[width=W](3) - pix
+        var rawy = (positions + 3 * j + 1).strided_load[width=W](3) - piy
+        var rawz = (positions + 3 * j + 2).strided_load[width=W](3) - piz
+        var base_jx = (base_shift + 3 * j).strided_load[width=W](3)
+        var base_jy = (base_shift + 3 * j + 1).strided_load[width=W](3)
+        var base_jz = (base_shift + 3 * j + 2).strided_load[width=W](3)
+        for sx0 in range(-rx, rx + 1):
+            var sx = SIMD[DType.int64, W](base_ix + sx0) - base_jx
+            for sy0 in range(-ry, ry + 1):
+                var sy = SIMD[DType.int64, W](base_iy + sy0) - base_jy
+                for sz0 in range(-rz, rz + 1):
+                    var sz = SIMD[DType.int64, W](base_iz + sz0) - base_jz
+                    var dx = (
+                        rawx + sx.cast[DType.float64]() * cell[0]
+                        + sy.cast[DType.float64]() * cell[3]
+                        + sz.cast[DType.float64]() * cell[6]
+                    )
+                    var dy = (
+                        rawy + sx.cast[DType.float64]() * cell[1]
+                        + sy.cast[DType.float64]() * cell[4]
+                        + sz.cast[DType.float64]() * cell[7]
+                    )
+                    var dz = (
+                        rawz + sx.cast[DType.float64]() * cell[2]
+                        + sy.cast[DType.float64]() * cell[5]
+                        + sz.cast[DType.float64]() * cell[8]
+                    )
+                    var r2 = dx * dx + dy * dy + dz * dz
+                    var selected = r2.lt(cutoff2)
+                    for lane in range(W):
+                        var atom_j = j + lane
+                        if (
+                            selected[lane]
+                            and (
+                                self_interaction or i != atom_j
+                                or sx[lane] != 0 or sy[lane] != 0 or sz[lane] != 0
+                            )
+                        ):
+                            pair_i[k] = Int64(i)
+                            pair_j[k] = Int64(atom_j)
+                            distances[k] = sqrt(r2[lane])
+                            vectors[3 * k] = dx[lane]
+                            vectors[3 * k + 1] = dy[lane]
+                            vectors[3 * k + 2] = dz[lane]
+                            shifts[3 * k] = sx[lane]
+                            shifts[3 * k + 1] = sy[lane]
+                            shifts[3 * k + 2] = sz[lane]
+                            k += 1
+        j += W
+    while j < n:
         var rawx = positions[3 * j] - pix
         var rawy = positions[3 * j + 1] - piy
         var rawz = positions[3 * j + 2] - piz
         for sx0 in range(-rx, rx + 1):
-            var sx = Int(base_shift[3 * i] - base_shift[3 * j]) + sx0
+            var sx = base_ix - Int(base_shift[3 * j]) + sx0
             for sy0 in range(-ry, ry + 1):
-                var sy = Int(base_shift[3 * i + 1] - base_shift[3 * j + 1]) + sy0
+                var sy = base_iy - Int(base_shift[3 * j + 1]) + sy0
                 for sz0 in range(-rz, rz + 1):
-                    var sz = Int(base_shift[3 * i + 2] - base_shift[3 * j + 2]) + sz0
-                    if not self_interaction and i == j and sx == 0 and sy == 0 and sz == 0:
-                        continue
-                    var dx = (
-                        rawx + Float64(sx) * cell[0]
-                        + Float64(sy) * cell[3] + Float64(sz) * cell[6]
-                    )
-                    var dy = (
-                        rawy + Float64(sx) * cell[1]
-                        + Float64(sy) * cell[4] + Float64(sz) * cell[7]
-                    )
-                    var dz = (
-                        rawz + Float64(sx) * cell[2]
-                        + Float64(sy) * cell[5] + Float64(sz) * cell[8]
-                    )
-                    var r2 = dx * dx + dy * dy + dz * dz
-                    if r2 < cutoff2:
-                        pair_i[k] = Int64(i)
-                        pair_j[k] = Int64(j)
-                        distances[k] = sqrt(r2)
-                        vectors[3 * k] = dx
-                        vectors[3 * k + 1] = dy
-                        vectors[3 * k + 2] = dz
-                        shifts[3 * k] = Int64(sx)
-                        shifts[3 * k + 1] = Int64(sy)
-                        shifts[3 * k + 2] = Int64(sz)
-                        k += 1
+                    var sz = base_iz - Int(base_shift[3 * j + 2]) + sz0
+                    if self_interaction or i != j or sx != 0 or sy != 0 or sz != 0:
+                        var dx = (
+                            rawx + Float64(sx) * cell[0]
+                            + Float64(sy) * cell[3] + Float64(sz) * cell[6]
+                        )
+                        var dy = (
+                            rawy + Float64(sx) * cell[1]
+                            + Float64(sy) * cell[4] + Float64(sz) * cell[7]
+                        )
+                        var dz = (
+                            rawz + Float64(sx) * cell[2]
+                            + Float64(sy) * cell[5] + Float64(sz) * cell[8]
+                        )
+                        var r2 = dx * dx + dy * dy + dz * dz
+                        if r2 < cutoff2:
+                            pair_i[k] = Int64(i)
+                            pair_j[k] = Int64(j)
+                            distances[k] = sqrt(r2)
+                            vectors[3 * k] = dx
+                            vectors[3 * k + 1] = dy
+                            vectors[3 * k + 2] = dz
+                            shifts[3 * k] = Int64(sx)
+                            shifts[3 * k + 1] = Int64(sy)
+                            shifts[3 * k + 2] = Int64(sz)
+                            k += 1
+        j += 1
     return k
 
 
@@ -291,20 +410,38 @@ def neighbor_fill(
 ):
     var nonperiodic = rx == 0 and ry == 0 and rz == 0
 
-    for i in range(n):
-        var start = Int(offsets[i])
-        if nonperiodic:
-            _ = neighbor_fill_one_nonperiodic(
-                positions, n, i, self_interaction, cutoff2,
-                pair_i + start, pair_j + start, distances + start,
-                vectors + 3 * start, shifts + 3 * start,
-            )
-        else:
-            _ = neighbor_fill_one(
-                positions, cell, base_shift, n, i, rx, ry, rz,
-                self_interaction, cutoff2, pair_i + start, pair_j + start,
-                distances + start, vectors + 3 * start, shifts + 3 * start,
-            )
+    var candidate_checks = n * n * (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1)
+    if not nonperiodic and candidate_checks >= 100_000 and n > 1:
+        var task_count = min(16, n)
+
+        @parameter
+        def fill_chunk(task: Int):
+            var first = task * n // task_count
+            var last = (task + 1) * n // task_count
+            for i in range(first, last):
+                var start = Int(offsets[i])
+                _ = neighbor_fill_one(
+                    positions, cell, base_shift, n, i, rx, ry, rz,
+                    self_interaction, cutoff2, pair_i + start, pair_j + start,
+                    distances + start, vectors + 3 * start, shifts + 3 * start,
+                )
+
+        parallelize[fill_chunk](task_count, task_count)
+    else:
+        for i in range(n):
+            var start = Int(offsets[i])
+            if nonperiodic:
+                _ = neighbor_fill_one_nonperiodic(
+                    positions, n, i, self_interaction, cutoff2,
+                    pair_i + start, pair_j + start, distances + start,
+                    vectors + 3 * start, shifts + 3 * start,
+                )
+            else:
+                _ = neighbor_fill_one(
+                    positions, cell, base_shift, n, i, rx, ry, rz,
+                    self_interaction, cutoff2, pair_i + start, pair_j + start,
+                    distances + start, vectors + 3 * start, shifts + 3 * start,
+                )
 
 
 def minimum_image(

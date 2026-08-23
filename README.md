@@ -101,17 +101,20 @@ results, not estimates.
 
 | case | mojo-ase | ASE | ASE / Mojo | result |
 |---|---:|---:|---:|---|
-| neighbor_list, 600 atoms nonperiodic | 2.059 ms | 34.337 ms | 16.67x | faster |
-| neighbor_list, 108-atom periodic Cu | 4.015 ms | 7.685 ms | 1.91x | faster |
-| find_mic, 200k triclinic vectors | 32.357 ms | 640.469 ms | 19.79x | faster |
-| LennardJones forces, 108 atoms | 2.578 ms | 57.730 ms | 22.40x | faster |
-| MorsePotential forces, 108 atoms | 2.921 ms | 265.253 ms | 90.81x | faster |
+| neighbor_list, 600 atoms nonperiodic | 2.888 ms | 26.311 ms | 9.11x | faster |
+| neighbor_list, 108-atom periodic Cu | 0.963 ms | 6.681 ms | 6.94x | faster |
+| find_mic, 200k triclinic vectors | 31.081 ms | 2265.510 ms | 72.89x | faster |
+| LennardJones forces, 108 atoms | 2.022 ms | 60.094 ms | 29.72x | faster |
+| MorsePotential forces, 108 atoms | 1.876 ms | 268.421 ms | 143.10x | faster |
 
 Results will vary with CPU, compiler, structure, cutoff, and system size. Run
 the benchmark on the target machine rather than treating this table as a
 universal speed claim.
 
-No GPU path is included.
+No GPU path is included. The only benchmark below 5x at baseline was the small,
+branch-heavy periodic neighbor search, where transfer and launch overhead would
+dominate. The arithmetic-heavy MIC and force cases were already more than 5x
+faster than ASE and were deliberately left outside the optimization scope.
 
 ## How it works
 
@@ -130,8 +133,8 @@ the FFI boundary.
 Neighbor construction uses a count pass followed by an exact-size fill pass.
 Periodic positions are represented by an integer base shift, and the kernel
 enumerates only the cell-image range geometrically capable of intersecting the
-cutoff. Nonperiodic candidate distances use native-width SIMD with a scalar
-tail. Count and fill work is split by atom across CPU workers once a search
-reaches 100,000 candidate checks; smaller searches remain serial. Force
-kernels consume the directed neighbor arrays and accumulate ASE-compatible
-per-atom energy, force, and virial contributions in one pass.
+cutoff. Candidate distances use native-width SIMD with a scalar tail. Periodic
+count and fill work is split by atom across CPU workers once a search reaches
+100,000 candidate checks; smaller and nonperiodic searches remain serial.
+Force kernels consume the directed neighbor arrays and accumulate
+ASE-compatible per-atom energy, force, and virial contributions in one pass.

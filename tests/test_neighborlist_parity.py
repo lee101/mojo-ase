@@ -63,13 +63,25 @@ def test_nonperiodic_simd_tail(n, self_interaction):
     )
 
 
-def test_parallel_candidate_threshold():
+@pytest.mark.parametrize("n", [1, 7, 8, 9, 15, 16, 17])
+@pytest.mark.parametrize("self_interaction", [False, True])
+def test_periodic_simd_tail(n, self_interaction):
     rng = np.random.default_rng(92)
-    positions = rng.uniform(0.0, 20.0, size=(320, 3))
-    args = ("ijdDS", [False] * 3, np.eye(3), positions, 0.8)
+    positions = rng.uniform(0.0, 8.0, size=(n, 3))
+    args = ("ijdDS", [True] * 3, np.eye(3) * 8.0, positions, 1.7)
     assert_neighbor_parity(
-        primitive_neighbor_list(*args),
-        ase_primitive_neighbor_list(*args),
+        primitive_neighbor_list(*args, self_interaction=self_interaction),
+        ase_primitive_neighbor_list(*args, self_interaction=self_interaction),
+    )
+
+
+@pytest.mark.parametrize("n", [60, 61])
+def test_parallel_candidate_threshold(n):
+    rng = np.random.default_rng(93)
+    positions = rng.uniform(0.0, 20.0, size=(n, 3))
+    args = ("ijdDS", [True] * 3, np.eye(3) * 20.0, positions, 0.8)
+    assert_neighbor_parity(
+        primitive_neighbor_list(*args), ase_primitive_neighbor_list(*args)
     )
 
 
