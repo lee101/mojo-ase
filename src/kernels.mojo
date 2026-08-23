@@ -4,14 +4,12 @@ All storage is owned by NumPy.  Exported functions receive integer addresses
 and reconstruct explicitly-originated pointers inside the C ABI boundary.
 """
 
-from std.algorithm import parallelize
 from std.math import exp, floor, sqrt
+from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime PARALLEL_CANDIDATES = 100_000
-comptime PARALLEL_TASKS = 8
 
 
 def fp(address: Int) -> FPtr:
@@ -120,35 +118,22 @@ def neighbor_counts(
     cutoff2: Float64,
     offsets: IPtr,
 ) -> Int:
-    var image_count = (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1)
-    var candidate_count = n * n * image_count
     var nonperiodic = rx == 0 and ry == 0 and rz == 0
 
-    @parameter
-    def count_task(task: Int):
-        var begin = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(begin, end):
-            if nonperiodic:
-                offsets[i] = Int64(
-                    neighbor_count_one_nonperiodic(
-                        positions, n, i, self_interaction, cutoff2
-                    )
+    for i in range(n):
+        if nonperiodic:
+            offsets[i] = Int64(
+                neighbor_count_one_nonperiodic(
+                    positions, n, i, self_interaction, cutoff2
                 )
-            else:
-                offsets[i] = Int64(
-                    neighbor_count_one(
-                        positions, cell, base_shift, n, i, rx, ry, rz,
-                        self_interaction, cutoff2,
-                    )
+            )
+        else:
+            offsets[i] = Int64(
+                neighbor_count_one(
+                    positions, cell, base_shift, n, i, rx, ry, rz,
+                    self_interaction, cutoff2,
                 )
-
-    if candidate_count >= PARALLEL_CANDIDATES:
-        parallelize[count_task](PARALLEL_TASKS)
-    else:
-        count_task(0)
-        for task in range(1, PARALLEL_TASKS):
-            count_task(task)
+            )
 
     comptime W = simd_width_of[DType.float64]()
     var vector_total = SIMD[DType.int64, W](0)
@@ -304,35 +289,22 @@ def neighbor_fill(
     vectors: FPtr,
     shifts: IPtr,
 ):
-    var image_count = (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1)
-    var candidate_count = n * n * image_count
     var nonperiodic = rx == 0 and ry == 0 and rz == 0
 
-    @parameter
-    def fill_task(task: Int):
-        var begin = task * n // PARALLEL_TASKS
-        var end = (task + 1) * n // PARALLEL_TASKS
-        for i in range(begin, end):
-            var start = Int(offsets[i])
-            if nonperiodic:
-                _ = neighbor_fill_one_nonperiodic(
-                    positions, n, i, self_interaction, cutoff2,
-                    pair_i + start, pair_j + start, distances + start,
-                    vectors + 3 * start, shifts + 3 * start,
-                )
-            else:
-                _ = neighbor_fill_one(
-                    positions, cell, base_shift, n, i, rx, ry, rz,
-                    self_interaction, cutoff2, pair_i + start, pair_j + start,
-                    distances + start, vectors + 3 * start, shifts + 3 * start,
-                )
-
-    if candidate_count >= PARALLEL_CANDIDATES:
-        parallelize[fill_task](PARALLEL_TASKS)
-    else:
-        fill_task(0)
-        for task in range(1, PARALLEL_TASKS):
-            fill_task(task)
+    for i in range(n):
+        var start = Int(offsets[i])
+        if nonperiodic:
+            _ = neighbor_fill_one_nonperiodic(
+                positions, n, i, self_interaction, cutoff2,
+                pair_i + start, pair_j + start, distances + start,
+                vectors + 3 * start, shifts + 3 * start,
+            )
+        else:
+            _ = neighbor_fill_one(
+                positions, cell, base_shift, n, i, rx, ry, rz,
+                self_interaction, cutoff2, pair_i + start, pair_j + start,
+                distances + start, vectors + 3 * start, shifts + 3 * start,
+            )
 
 
 def minimum_image(
@@ -540,6 +512,7 @@ def mase_neighbor_count(
     cutoff2: Float64,
     offsets: Int,
 ) abi("C") -> Int:
+    initialize_runtime()
     return neighbor_counts(
         fp(positions), fp(cell), ip(base_shift), n, rx, ry, rz,
         self_interaction != 0, cutoff2, ip(offsets),
@@ -564,6 +537,7 @@ def mase_neighbor_fill(
     vectors: Int,
     shifts: Int,
 ) abi("C"):
+    initialize_runtime()
     neighbor_fill(
         fp(positions), fp(cell), ip(base_shift), ip(offsets), n, rx, ry, rz,
         self_interaction != 0, cutoff2, ip(pair_i), ip(pair_j), fp(distances),
@@ -583,6 +557,7 @@ def mase_minimum_image(
     py: Int,
     pz: Int,
 ) abi("C"):
+    initialize_runtime()
     minimum_image(
         fp(vectors), fp(cell), fp(inverse), fp(result), fp(lengths),
         n, px, py, pz,
@@ -604,6 +579,7 @@ def mase_lennard_jones(
     forces: Int,
     stresses: Int,
 ) abi("C"):
+    initialize_runtime()
     lennard_jones(
         ip(pair_i), fp(vectors), npairs, natoms, sigma, epsilon, rc, ro,
         smooth != 0, fp(energies), fp(forces), fp(stresses),
@@ -626,6 +602,7 @@ def mase_morse(
     forces: Int,
     stress: Int,
 ) abi("C"):
+    initialize_runtime()
     morse(
         ip(pair_i), fp(distances), fp(vectors), npairs, natoms, epsilon,
         rho0, r0, rcut1, rcut2, fp(energies), fp(forces), fp(stress),

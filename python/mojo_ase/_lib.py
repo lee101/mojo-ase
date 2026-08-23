@@ -64,13 +64,6 @@ def lib() -> ctypes.CDLL:
     global _LIBRARY
     if _LIBRARY is None:
         _LIBRARY = ctypes.CDLL(build())
-        initialize_cpu = (
-            _LIBRARY.KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice
-        )
-        initialize_cpu.argtypes = []
-        initialize_cpu.restype = ctypes.c_void_p
-        if not initialize_cpu():
-            raise RuntimeError("failed to initialize the Mojo CPU runtime")
         for name, (argtypes, restype) in _SIGNATURES.items():
             fn = getattr(_LIBRARY, name)
             fn.argtypes = argtypes
