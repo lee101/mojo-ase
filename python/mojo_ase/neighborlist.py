@@ -7,9 +7,10 @@ import math
 import numpy as np
 from ase.data import atomic_numbers, covalent_radii
 from ase.geometry import complete_cell
-
+from . import _lib
 from ._lib import addr, f64, i64, lib
 from .geometry import find_mic
+
 
 
 def natural_cutoffs(atoms, mult=1, **kwargs):
@@ -149,18 +150,25 @@ def primitive_neighbor_list(
     offsets = np.empty(n, dtype=np.int64)
     if base_shift is None:
         base_shift = offsets
-    count = lib().mase_neighbor_count(
-        addr(positions_array),
-        addr(cell_array),
-        addr(base_shift),
-        n,
-        int(ranges[0]),
-        int(ranges[1]),
-        int(ranges[2]),
-        int(bool(self_interaction)),
-        max_cutoff * max_cutoff,
-        addr(offsets),
+    pos_addr = addr(positions_array)
+    cell_addr = addr(cell_array)
+    shift_addr = addr(base_shift)
+    cutoff2 = max_cutoff * max_cutoff
+    rx, ry, rz = int(ranges[0]), int(ranges[1]), int(ranges[2])
+    self_int = int(bool(self_interaction))
+    workers = _lib.MAX_NEIGHBOR_WORKERS
+
+    def count_range(part):
+        first, last = part
+        lib().mase_neighbor_count_range(
+            pos_addr, cell_addr, shift_addr, n, first, last,
+            rx, ry, rz, self_int, cutoff2, addr(offsets),
+        )
+
+    _lib.fan_out(
+        count_range, _lib.split(n, workers), workers, candidate_count
     )
+    count = lib().mase_offsets_to_starts(addr(offsets), n)
     if count < 0 or count > candidate_count:
         raise RuntimeError(f"invalid neighbor count returned by Mojo: {count}")
     if count == 0:
@@ -171,23 +179,20 @@ def primitive_neighbor_list(
     distances = np.empty(count, dtype=np.float64)
     vectors = np.empty((count, 3), dtype=np.float64)
     shifts = np.empty((count, 3), dtype=np.int64)
-    lib().mase_neighbor_fill(
-        addr(positions_array),
-        addr(cell_array),
-        addr(base_shift),
-        n,
-        int(ranges[0]),
-        int(ranges[1]),
-        int(ranges[2]),
-        int(bool(self_interaction)),
-        max_cutoff * max_cutoff,
-        addr(offsets),
-        addr(pair_i),
-        addr(pair_j),
-        addr(distances),
-        addr(vectors),
-        addr(shifts),
+    pair_i_addr, pair_j_addr = addr(pair_i), addr(pair_j)
+    dist_addr, vec_addr, sh_addr = (
+        addr(distances), addr(vectors), addr(shifts)
     )
+
+    def fill_range(part):
+        first, last = part
+        lib().mase_neighbor_fill_range(
+            pos_addr, cell_addr, shift_addr, n, first, last,
+            rx, ry, rz, self_int, cutoff2, addr(offsets),
+            pair_i_addr, pair_j_addr, dist_addr, vec_addr, sh_addr,
+        )
+
+    _lib.fan_out(fill_range, _lib.split(n, workers), workers, candidate_count)
 
     if filtering is not None:
         if filtering[0] == "radii":

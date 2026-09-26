@@ -4,7 +4,6 @@ All storage is owned by NumPy.  Exported functions receive integer addresses
 and reconstruct explicitly-originated pointers inside the C ABI boundary.
 """
 
-from max.algorithm import parallelize
 from std.math import exp, floor, sqrt
 from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
@@ -152,53 +151,40 @@ def neighbor_count_one_nonperiodic(
     return count
 
 
-def neighbor_counts(
+def neighbor_count_range(
     positions: FPtr,
     cell: FPtr,
     base_shift: IPtr,
     n: Int,
+    first: Int,
+    last: Int,
     rx: Int,
     ry: Int,
     rz: Int,
     self_interaction: Bool,
     cutoff2: Float64,
     offsets: IPtr,
-) -> Int:
+):
+    """Raw per-atom neighbour counts for atoms [first, last)."""
     var nonperiodic = rx == 0 and ry == 0 and rz == 0
-
-    var candidate_checks = n * n * (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1)
-    if not nonperiodic and candidate_checks >= 100_000 and n > 1:
-        var task_count = min(16, n)
-
-        @parameter
-        def count_chunk(task: Int):
-            var first = task * n // task_count
-            var last = (task + 1) * n // task_count
-            for i in range(first, last):
-                offsets[i] = Int64(
-                    neighbor_count_one(
-                        positions, cell, base_shift, n, i, rx, ry, rz,
-                        self_interaction, cutoff2,
-                    )
+    for i in range(first, last):
+        if nonperiodic:
+            offsets[i] = Int64(
+                neighbor_count_one_nonperiodic(
+                    positions, n, i, self_interaction, cutoff2
                 )
-
-        parallelize[count_chunk](task_count, task_count)
-    else:
-        for i in range(n):
-            if nonperiodic:
-                offsets[i] = Int64(
-                    neighbor_count_one_nonperiodic(
-                        positions, n, i, self_interaction, cutoff2
-                    )
+            )
+        else:
+            offsets[i] = Int64(
+                neighbor_count_one(
+                    positions, cell, base_shift, n, i, rx, ry, rz,
+                    self_interaction, cutoff2,
                 )
-            else:
-                offsets[i] = Int64(
-                    neighbor_count_one(
-                        positions, cell, base_shift, n, i, rx, ry, rz,
-                        self_interaction, cutoff2,
-                    )
-                )
+            )
 
+
+def offsets_to_starts(offsets: IPtr, n: Int) -> Int:
+    """Turn raw counts in [0, n) into exclusive prefix starts; return the total."""
     comptime W = simd_width_of[DType.float64]()
     var vector_total = SIMD[DType.int64, W](0)
     var i = 0
@@ -391,12 +377,14 @@ def neighbor_fill_one_nonperiodic(
     return k
 
 
-def neighbor_fill(
+def neighbor_fill_range(
     positions: FPtr,
     cell: FPtr,
     base_shift: IPtr,
     offsets: IPtr,
     n: Int,
+    first: Int,
+    last: Int,
     rx: Int,
     ry: Int,
     rz: Int,
@@ -408,40 +396,22 @@ def neighbor_fill(
     vectors: FPtr,
     shifts: IPtr,
 ):
+    """Write the pairs owned by atoms [first, last); their slots are disjoint."""
     var nonperiodic = rx == 0 and ry == 0 and rz == 0
-
-    var candidate_checks = n * n * (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1)
-    if not nonperiodic and candidate_checks >= 100_000 and n > 1:
-        var task_count = min(16, n)
-
-        @parameter
-        def fill_chunk(task: Int):
-            var first = task * n // task_count
-            var last = (task + 1) * n // task_count
-            for i in range(first, last):
-                var start = Int(offsets[i])
-                _ = neighbor_fill_one(
-                    positions, cell, base_shift, n, i, rx, ry, rz,
-                    self_interaction, cutoff2, pair_i + start, pair_j + start,
-                    distances + start, vectors + 3 * start, shifts + 3 * start,
-                )
-
-        parallelize[fill_chunk](task_count, task_count)
-    else:
-        for i in range(n):
-            var start = Int(offsets[i])
-            if nonperiodic:
-                _ = neighbor_fill_one_nonperiodic(
-                    positions, n, i, self_interaction, cutoff2,
-                    pair_i + start, pair_j + start, distances + start,
-                    vectors + 3 * start, shifts + 3 * start,
-                )
-            else:
-                _ = neighbor_fill_one(
-                    positions, cell, base_shift, n, i, rx, ry, rz,
-                    self_interaction, cutoff2, pair_i + start, pair_j + start,
-                    distances + start, vectors + 3 * start, shifts + 3 * start,
-                )
+    for i in range(first, last):
+        var start = Int(offsets[i])
+        if nonperiodic:
+            _ = neighbor_fill_one_nonperiodic(
+                positions, n, i, self_interaction, cutoff2,
+                pair_i + start, pair_j + start, distances + start,
+                vectors + 3 * start, shifts + 3 * start,
+            )
+        else:
+            _ = neighbor_fill_one(
+                positions, cell, base_shift, n, i, rx, ry, rz,
+                self_interaction, cutoff2, pair_i + start, pair_j + start,
+                distances + start, vectors + 3 * start, shifts + 3 * start,
+            )
 
 
 def minimum_image(
@@ -636,32 +606,40 @@ def morse(
         stress[8] += 0.5 * dz * fz
 
 
-@export("mase_neighbor_count")
-def mase_neighbor_count(
+@export("mase_neighbor_count_range")
+def mase_neighbor_count_range(
     positions: Int,
     cell: Int,
     base_shift: Int,
     n: Int,
+    first: Int,
+    last: Int,
     rx: Int,
     ry: Int,
     rz: Int,
     self_interaction: Int,
     cutoff2: Float64,
     offsets: Int,
-) abi("C") -> Int:
-    initialize_runtime()
-    return neighbor_counts(
-        fp(positions), fp(cell), ip(base_shift), n, rx, ry, rz,
+) abi("C"):
+    neighbor_count_range(
+        fp(positions), fp(cell), ip(base_shift), n, first, last, rx, ry, rz,
         self_interaction != 0, cutoff2, ip(offsets),
     )
 
 
-@export("mase_neighbor_fill")
-def mase_neighbor_fill(
+@export("mase_offsets_to_starts")
+def mase_offsets_to_starts(offsets: Int, n: Int) abi("C") -> Int:
+    return offsets_to_starts(ip(offsets), n)
+
+
+@export("mase_neighbor_fill_range")
+def mase_neighbor_fill_range(
     positions: Int,
     cell: Int,
     base_shift: Int,
     n: Int,
+    first: Int,
+    last: Int,
     rx: Int,
     ry: Int,
     rz: Int,
@@ -674,11 +652,10 @@ def mase_neighbor_fill(
     vectors: Int,
     shifts: Int,
 ) abi("C"):
-    initialize_runtime()
-    neighbor_fill(
-        fp(positions), fp(cell), ip(base_shift), ip(offsets), n, rx, ry, rz,
-        self_interaction != 0, cutoff2, ip(pair_i), ip(pair_j), fp(distances),
-        fp(vectors), ip(shifts),
+    neighbor_fill_range(
+        fp(positions), fp(cell), ip(base_shift), ip(offsets), n, first, last,
+        rx, ry, rz, self_interaction != 0, cutoff2, ip(pair_i), ip(pair_j),
+        fp(distances), fp(vectors), ip(shifts),
     )
 
 

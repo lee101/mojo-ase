@@ -14,6 +14,7 @@ from ase.neighborlist import first_neighbors as ase_first_neighbors
 from ase.neighborlist import neighbor_list as ase_neighbor_list
 from ase.neighborlist import primitive_neighbor_list as ase_primitive_neighbor_list
 
+from mojo_ase import _lib as mojo_ase_lib
 from mojo_ase.neighborlist import (
     NewPrimitiveNeighborList,
     PrimitiveNeighborList,
@@ -82,6 +83,20 @@ def test_parallel_candidate_threshold(n):
     args = ("ijdDS", [True] * 3, np.eye(3) * 20.0, positions, 0.8)
     assert_neighbor_parity(
         primitive_neighbor_list(*args), ase_primitive_neighbor_list(*args)
+    )
+
+
+
+@pytest.mark.parametrize("workers", [1, 16])
+def test_neighbor_fan_out_matches_upstream(monkeypatch, workers):
+    rng = np.random.default_rng(94)
+    positions = rng.uniform(0.0, 20.0, size=(160, 3))
+    args = ("ijdDS", [True] * 3, np.eye(3) * 20.0, positions, 0.8)
+    monkeypatch.setattr(mojo_ase_lib, "MIN_PARALLEL_WORK", 0)
+    monkeypatch.setattr(mojo_ase_lib, "MAX_NEIGHBOR_WORKERS", workers)
+    assert_neighbor_parity(
+        primitive_neighbor_list(*args),
+        ase_primitive_neighbor_list(*args),
     )
 
 
